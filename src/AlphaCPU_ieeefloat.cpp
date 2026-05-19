@@ -235,18 +235,28 @@ u32 CAlphaCPU::ieee_sts(u64 op)
 u64 CAlphaCPU::ieee_cvtst(u64 op, u32 ins)
 {
 	UFP b;
-	u32 ftpb;
 
-	ftpb = ieee_unpack(op, &b, ins);    /* unpack; norm dnorm */
-	if (ftpb == UFT_DENORM)              /* denormal? */
+	/* CVTST is the one operation where an S-denormal input is *not*
+	   exceptional — it's representable as a T-normal. Bypass ieee_unpack
+	   (which would unconditionally raise INV on denormals) and normalize
+	   directly. Per HRM 4.8.4, finite S inputs (including denormals) do
+	   not raise invalid-operation on CVTST. */
+	if (FPR_GETEXP(op) == 0 && FPR_GETFRAC(op) != 0
+	    && !(state.fpcr & FPCR_DNZ))
 	{
-
-		// i'm not completely sure this is correct...
-		b.exp = b.exp + T_BIAS - S_BIAS;  /* change 0 exp to T */
-		return ieee_rpack(&b, ins, DT_T); /* round, pack */
+		b.sign = FPR_GETSIGN(op);
+		b.exp = 0;
+		b.frac = FPR_GETFRAC(op) << FPR_GUARD;
+		ieee_norm(&b);                     /* renormalize denormal */
+		b.exp = b.exp + T_BIAS - S_BIAS;   /* rebias S-exp to T-exp */
+		return ieee_rpack(&b, ins, DT_T);
 	}
-	else
-		return op;  /* identity */
+
+	/* For zero / normal / infinity / NaN the S-format bit pattern is
+	   already a valid T value; ieee_unpack is invoked solely for its
+	   sNaN trap side-effect, then the input is returned unchanged. */
+	(void)ieee_unpack(op, &b, ins);
+	return op;
 }
 
 /**
@@ -428,7 +438,9 @@ u64 CAlphaCPU::ieee_cvtfi(u64 op, u32 ins)
 		ovf = 1;  /* overflow? */
 
 	if (ovf)
-		ieee_trap(TRAP_IOV, ins & I_FTRP_V, 0, 0);  /* overflow trap */
+		/* Pass `ins` (not 0) so I_GETRC(ins) reports the real destination
+		   register and ins & I_FTRP_S sets TRAP_SWC correctly on /S. */
+		ieee_trap(TRAP_IOV, ins & I_FTRP_V, 0, ins);  /* overflow trap */
 	if (ovf || sticky) /* ovflo or round? */
 		ieee_trap(TRAP_INE, Q_SUI(ins), FPCR_INED, ins);
 	return(a.sign ? NEG_Q(a.frac) : a.frac);
@@ -890,8 +902,9 @@ u64 CAlphaCPU::ieee_rpack(UFP* r, u32 ins, u32 dp)
 		   flush-to-zero result. The two bits are independent per HRM 4.7.7.1. */
 		ieee_trap(TRAP_UNF, ins & I_FTRP_U, FPCR_UNFD, ins);
 		ieee_trap(TRAP_INE, Q_SUI(ins), FPCR_INED, ins);          /* set inexact */
-		return 0;
-	} /* underflow to +0 */
+		/* Preserve sign of zero on underflow per IEEE-754 / HRM 4.7.7.3. */
+		return ((u64)r->sign) << FPR_V_SIGN;
+	} /* underflow to signed zero */
 
 	res = (((u64)r->sign) << FPR_V_SIGN) |           /* form result */
 		(((u64)r->exp) << FPR_V_EXP) | ((r->frac >> FPR_GUARD) & FPR_FRAC);
