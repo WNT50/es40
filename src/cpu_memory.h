@@ -76,11 +76,15 @@
 
 #define DO_LDL    if ((REG_1 & 0x1f) != 31) READ_VIRT_F(state.r[REG_2] + DISP_16, 32, state.r[REG_1], sext_u64_32);
 
-#define DO_LDL_L  if ((REG_1 & 0x1f) != 31) READ_VIRT_LOCK_F(state.r[REG_2] + DISP_16, 32, state.r[REG_1], sext_u64_32);
+/* LDx_L: always perform the load and establish the lock, regardless of Ra.
+   The state.r[31] auto-clear after each instruction makes writing to R31
+   harmless, but the cpu_lock side-effect must occur for correct LL/SC pairing.
+*/
+#define DO_LDL_L  READ_VIRT_LOCK_F(state.r[REG_2] + DISP_16, 32, state.r[REG_1], sext_u64_32);
 
 #define DO_LDQ    if ((REG_1 & 0x1f) != 31) READ_VIRT(state.r[REG_2] + DISP_16, 64, state.r[REG_1]);
 
-#define DO_LDQ_L  if ((REG_1 & 0x1f) != 31) READ_VIRT_LOCK(state.r[REG_2] + DISP_16, 64, state.r[REG_1]);
+#define DO_LDQ_L  READ_VIRT_LOCK(state.r[REG_2] + DISP_16, 64, state.r[REG_1]);
 
 #define DO_LDQ_U  if ((REG_1 & 0x1f) != 31) READ_VIRT((state.r[REG_2] + DISP_16) & ~U64(0x7), 64, state.r[REG_1]);
 
