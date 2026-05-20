@@ -253,9 +253,13 @@ u64 CAlphaCPU::ieee_cvtst(u64 op, u32 ins)
 	}
 
 	/* For zero / normal / infinity / NaN the S-format bit pattern is
-	   already a valid T value; ieee_unpack is invoked solely for its
-	   sNaN trap side-effect, then the input is returned unchanged. */
-	(void)ieee_unpack(op, &b, ins);
+	   already a valid T value. ieee_unpack raises INV on sNaN; we must
+	   also silence the NaN to qNaN on the result (HRM 4.8.4 / IEEE-754
+	   7.2: an invalid-op result that returns a NaN must set the QNAN bit).
+	   Mirrors the sibling helper ieee_cvtts. */
+	u32 ftpb = ieee_unpack(op, &b, ins);
+	if (ftpb == UFT_NAN)
+		return op | QNAN;
 	return op;
 }
 
@@ -428,6 +432,8 @@ u64 CAlphaCPU::ieee_cvtfi(u64 op, u32 ins)
 	}
 
 	rndm = I_GETFRND(ins);  /* get round mode */
+	if (rndm == I_FRND_D)
+		rndm = FPCR_GETFRND(state.fpcr);  /* dynamic? use FPCR<DYN> */
 	if (((rndm == I_FRND_N) && (sticky & Q_SIGN))  /* nearest? */
 		|| ((rndm == I_FRND_P) && !a.sign && sticky) /* +inf and +? */
 		|| ((rndm == I_FRND_M) && a.sign && sticky)) /* -inf and -? */
