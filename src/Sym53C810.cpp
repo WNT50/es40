@@ -1531,6 +1531,11 @@ void CSym53C810::check_state()
 	if (myThread && !myThread->isRunning())
 		FAILURE(Thread, "SYM thread has died");
 
+	// Runs on the clock thread: take myRegLock so the GP-timer RAISE() below
+	// doesn't race the SCRIPTS thread's eval_interrupts(). RAII unlock covers
+	// the early returns below.
+	CScopedLock<CMutex> regLock(myRegLock);
+
 	if (state.gen_timer)
 	{
 		state.gen_timer--;
@@ -2846,7 +2851,9 @@ void CSym53C810::eval_interrupts()
 	// stack. The interrupt stack, however, doesn't keep track of the order in which
 	// interrupts come in, so when the interrupt stack is moved down into the 
 	// interrupt registers, multiple interrupt bits may become active.)
-	if (!R8(SIST0) && !R8(SIST1) && !R8(DSTAT))
+	// Mask DFE (DSTAT bit 7, an always-set status bit) so this stacked-
+	// interrupt drain isn't dead code -- DSTAT is never 0 otherwise.
+	if (!R8(SIST0) && !R8(SIST1) && !(R8(DSTAT) & DSTAT_RC))
 	{
 		R8(SIST0) |= state.sist0_stack;
 		R8(SIST1) |= state.sist1_stack;
