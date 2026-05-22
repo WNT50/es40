@@ -106,6 +106,7 @@ public:
   void            set_atapi_mode() { atapi_mode = true; };
 
   int             do_scsi_command();
+  int             mode_sense_page(int page, bool changeable, int q);
   int             do_scsi_message();
   void            do_scsi_error(int errcode, int info = 0);
 

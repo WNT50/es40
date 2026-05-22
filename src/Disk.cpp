@@ -602,6 +602,7 @@ void CDisk::scsi_xfer_done_me(int bus)
 #define SCSIMP_RIGID_GEOMETRY       0x04
 #define SCSIMP_FLEX_PARAMS          0x05
 #define SCSIMP_CACHING              0x08
+#define SCSIMP_INFO_EXCEPTIONS      0x1C
 #define SCSIMP_CDROM_CAP            0x2A
 
 #define SCSI_OK                     0
@@ -889,6 +890,77 @@ int read_sub_channel(uint8_t* buf, bool sub_q, bool msf, int start_track, int fo
 	}
 
 	return ret_len;
+}
+
+/**
+ * \brief Emit one MODE SENSE mode page at offset q, returning the offset just
+ *        past it.
+ *
+ * Used by the page 0x3F ("return all supported pages") request; mirrors the
+ * single-page templates in do_scsi_command(). The body is zeroed first, so it
+ * stays correct even when it lands past the caller's pre-zeroed region.
+ **/
+int CDisk::mode_sense_page(int page, bool changeable, int q)
+{
+	u8* d = state.scsi.dati.data;
+	int len;
+
+	switch (page)
+	{
+	case SCSIMP_READ_WRITE_ERRREC: len = 10;   break;
+	case SCSIMP_FORMAT_PARAMS:     len = 22;   break;
+	case SCSIMP_RIGID_GEOMETRY:    len = 22;   break;
+	case SCSIMP_CACHING:           len = 0x12; break;
+	case SCSIMP_INFO_EXCEPTIONS:   len = 0x0a; break;
+	case SCSIMP_CDROM_CAP:         len = 0x14; break;
+	default:                       return q;   // unknown page: emit nothing
+	}
+
+	for (int i = 0; i < len + 2; i++)
+		d[q + i] = 0;
+	d[q + 0] = (u8)page;
+	d[q + 1] = (u8)len;
+
+	if (!changeable)
+	{
+		switch (page)
+		{
+		case SCSIMP_FORMAT_PARAMS:
+			d[q + 11] = (u8)get_sectors();
+			d[q + 12] = (u8)(get_block_size() >> 8) & 255;
+			d[q + 13] = (u8)(get_block_size() >> 0) & 255;
+			break;
+
+		case SCSIMP_RIGID_GEOMETRY:
+			d[q + 2] = (u8)(get_cylinders() >> 16) & 255;
+			d[q + 3] = (u8)(get_cylinders() >> 8) & 255;
+			d[q + 4] = (u8)get_cylinders() & 255;
+			d[q + 5] = (u8)get_heads();
+			d[q + 20] = (7200 >> 8) & 255;
+			d[q + 21] = 7200 & 255;
+			break;
+
+		case SCSIMP_CACHING:
+			d[q + 2] = 0x0a;
+			break;
+
+		case SCSIMP_CDROM_CAP:
+			d[q + 2] = 0x03;
+			d[q + 6] = state.scsi.locked ? 0x23 : 0x21;
+			d[q + 8] = (u8)(2800 >> 8);
+			d[q + 9] = (u8)(2800 >> 0);
+			d[q + 12] = (u8)(64 >> 8);
+			d[q + 13] = (u8)(64 >> 0);
+			d[q + 14] = (u8)(2800 >> 8);
+			d[q + 15] = (u8)(2800 >> 0);
+			break;
+
+		default:
+			break;
+		}
+	}
+
+	return q + len + 2;
 }
 
 /**
@@ -1406,6 +1478,33 @@ int CDisk::do_scsi_command()
 
 			do_scsi_error(SCSI_OK);
 
+			// Page 0x3F = return every mode page the device supports (SPC).
+			// Concatenate the implemented pages after the header + block
+			// descriptor and report the real mode data length; the buffer past
+			// them is already zero-padded to the allocation length we return.
+			if (pagecode == 0x3f)
+			{
+				q = mode_sense_page(SCSIMP_READ_WRITE_ERRREC, changeable, q);
+				if (!cdrom())
+				{
+					q = mode_sense_page(SCSIMP_FORMAT_PARAMS, changeable, q);
+					q = mode_sense_page(SCSIMP_RIGID_GEOMETRY, changeable, q);
+				}
+				q = mode_sense_page(SCSIMP_CACHING, changeable, q);
+				q = mode_sense_page(SCSIMP_INFO_EXCEPTIONS, changeable, q);
+				if (cdrom())
+					q = mode_sense_page(SCSIMP_CDROM_CAP, changeable, q);
+
+				if (state.scsi.cmd.data[0] == SCSICMD_MODE_SENSE)
+					state.scsi.dati.data[0] = (u8)(q - 1);
+				else
+				{
+					state.scsi.dati.data[0] = (u8)((q - 2) >> 8);
+					state.scsi.dati.data[1] = (u8)(q - 2);
+				}
+				break;
+			}
+
 			//  descriptors, 8 bytes (each)
 			//  page, n bytes (each)
 			switch (pagecode)
@@ -1522,6 +1621,13 @@ int CDisk::do_scsi_command()
 					state.scsi.dati.data[q + 18] = 0;
 					state.scsi.dati.data[q + 19] = 0;
 				}
+				break;
+
+			case SCSIMP_INFO_EXCEPTIONS:  // informational exceptions control (IEC)
+				state.scsi.dati.data[q + 0] = pagecode;
+				state.scsi.dati.data[q + 1] = 0x0a;   // length
+				// Body left zero: DEXCPT=0, MRIE=0 (no informational-exception
+				// reporting). A valid, benign page so 0x1C no longer rejects.
 				break;
 
 			case SCSIMP_CDROM_CAP:  // CD-ROM capabilities
