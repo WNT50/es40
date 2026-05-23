@@ -1846,9 +1846,12 @@ u64 CSystem::cchip_csr_read(u32 a, CSystemComponent* source)
 		return state.cchip.csc;
 
 	case 0x080:
-
 		//    printf("MISC: %016" PRIx64 " from CPU %d (@%" PRIx64 ") (other @ %" PRIx64 ").\n",state.cchip.misc | cpu->get_cpuid(),cpu->get_cpuid(), cpu->get_pc()-4, acCPUs[1-cpu->get_cpuid()]->get_pc());
+	{
+		// Consistent read of MISC against the concurrent RMW in cchip_csr_write()/clear_clock_int().
+		std::lock_guard<std::mutex> g(drir_lock);
 		return state.cchip.misc | ((CAlphaCPU*)source)->get_cpuid();
+	}
 
 	case 0x0c0: { // MPD: bit3=DR (SDA read), bit2=CKR (SCL read), bits1:0 read as 0
 		uint8_t v = 0;
@@ -1904,6 +1907,10 @@ void CSystem::cchip_csr_write(u32 a, u64 data, CSystemComponent* source)
 		return;
 
 	case 0x080: // MISC
+	{
+		// Serialize the MISC RMW + IPI delivery against other CPUs and against
+		// interrupt()/clear_clock_int(); irq_h() is lock-free and never re-enters here.
+		std::lock_guard<std::mutex> g(drir_lock);
 		state.cchip.misc |= (data & U64(0x00000f0000f00000));     // W1S
 		state.cchip.misc &= ~(data & U64(0x0000000010000ff0));    // W1C
 		if (data & U64(0x0000000001000000))
@@ -1948,8 +1955,10 @@ void CSystem::cchip_csr_write(u32 a, u64 data, CSystemComponent* source)
 				if (data & (U64(0x100) << i))
 				{
 					acCPUs[i]->irq_h(3, false, 0);
+#ifdef DEBUG_IPI
 					printf("*** IP interrupt cleared for CPU %d from CPU %d(@ %" PRIx64 ").\n",
 						i, cpu->get_cpuid(), cpu->get_pc() - 4);
+#endif
 				}
 			}
 		}
@@ -1963,8 +1972,10 @@ void CSystem::cchip_csr_write(u32 a, u64 data, CSystemComponent* source)
 				{
 					state.cchip.misc |= U64(0x100) << i;
 					acCPUs[i]->irq_h(3, true, 0);
+#ifdef DEBUG_IPI
 					printf("*** IP interrupt set for CPU %d from CPU %d(@ %" PRIx64 ")\n", i,
 						cpu->get_cpuid(), cpu->get_pc() - 4);
+#endif
 
 					//          CThread::sleep(10);
 				}
@@ -1972,6 +1983,7 @@ void CSystem::cchip_csr_write(u32 a, u64 data, CSystemComponent* source)
 		}
 
 		return;
+	}
 
 	case 0x0c0: { // MPD
 		// MPD: bit0=CKS (SCL driver: 1=release, 0=pull low)
@@ -2991,8 +3003,24 @@ void CSystem::panic(char* message, int flags)
  **/
 void CSystem::clear_clock_int(int ProcNum)
 {
+	std::lock_guard<std::mutex> g(drir_lock);
 	state.cchip.misc &= ~(U64(0x10) << ProcNum);
 	acCPUs[ProcNum]->irq_h(2, false, 0);
+}
+
+/**
+ * Acknowledge an interprocessor interrupt for a CPU. The IPI has no device to
+ * deassert b_irq<3>, so (like the interval clock) PALcode clears MISC<IPINTR>
+ * on dispatch; otherwise it re-fires the instant IPL drops. (HRM 6.3.3)
+ **/
+void CSystem::clear_ipi(int ProcNum)
+{
+	std::lock_guard<std::mutex> g(drir_lock);
+	state.cchip.misc &= ~(U64(0x100) << ProcNum);
+	acCPUs[ProcNum]->irq_h(3, false, 0);
+#ifdef DEBUG_IPI
+	printf("*** IP interrupt cleared for CPU %d (PALcode dispatch ack).\n", ProcNum);
+#endif
 }
 
 /* ---------------- SPD generation + init ---------------- */

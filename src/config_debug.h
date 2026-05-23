@@ -142,6 +142,9 @@
 
 //#define DEBUG_CCHIP
 
+// Define to trace interprocessor-interrupt (IPI) set/clear in the Cchip MISC handler
+//#define DEBUG_IPI
+
 // Define for these VGA debugs
 //#define DEBUG_VGA_EXITS
 //#define DEBUG_VGA_UPDATES

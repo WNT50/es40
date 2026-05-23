@@ -273,6 +273,7 @@ public:
 #define PANIC_ASKSHUTDOWN 2
 #define PANIC_LISTING     4
   void          clear_clock_int(int ProcNum);
+  void          clear_ipi(int ProcNum);   // ack interprocessor interrupt: clear MISC<IPINTR>, drop b_irq<3>
   u64           get_c_misc();
   u64           get_c_dir(int ProcNum);
   u64           get_c_dim(int ProcNum);

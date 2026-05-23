@@ -1092,7 +1092,17 @@ int CAlphaCPU::vmspal_ent_ext_int(int ei)
 	state.exc_addr = state.current_pc;
 	p23 = state.current_pc;
 	p7 = ei;
-	if (ei & 0x04)
+	if (ei & 0x08)
+	{
+		// Interprocessor interrupt (b_irq<3>, HRM 6.3.3). clear_ipi() acks it (no
+		// device deasserts the line), then vector via the OpenVMS IPINTR SCB slot.
+		// Highest b_irq => checked before timer/device.
+		cSystem->clear_ipi(state.iProcNum);
+		p20 = 0x610;
+		p7 = 0x16;
+		do_11670 = true;
+	}
+	else if (ei & 0x04)
 	{
 
 		// TIMER interrupt

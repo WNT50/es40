@@ -979,6 +979,10 @@ void CAlphaCPU::execute()
 
 		if (state.check_int && !(state.pc & 1))
 		{
+			// Clear the interrupt doorbell up front. A remote irq_h() (e.g. an IPI from
+			// another CPU) sets eir then re-raises check_int; clearing first guarantees a
+			// cross-thread re-raise is re-checked next tick rather than lost by a late clear.
+			state.check_int = false;
 
 			// One or more of the variables that affect interrupt status have changed, and we are not
 			// currently inside PALmode. It is not certain that this means we hava an interrupt to
@@ -990,8 +994,10 @@ void CAlphaCPU::execute()
 				// case, our VMS PALcode replacement routines are valid, and should be used as it is
 				// faster than using the original PALcode.
 
-				if (state.eir & state.eien & 6)
-					if (vmspal_ent_ext_int(state.eir & state.eien & 6))
+				// irq<1>=device, irq<2>=timer, irq<3>=IPI. (Was 0x6 = device+timer only,
+				// which stranded incoming IPIs under VMS PALcode -> CPUSPINWAIT.)
+				if (state.eir & state.eien & 0xe)
+					if (vmspal_ent_ext_int(state.eir & state.eien & 0xe))
 						return;
 
 				if (state.sir & state.sien & 0xfffc)
@@ -1029,9 +1035,6 @@ void CAlphaCPU::execute()
 				}
 			}
 
-			// This point is reached only if there are no more active interrupts. We can safely set
-			// check_int to false now to save time on the next CPU clock ticks.
-			state.check_int = false;
 		}
 
 		// If profiling is enabled, increase the profiling counter for the current block of addresses.

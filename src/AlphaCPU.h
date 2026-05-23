@@ -218,6 +218,8 @@
 #if !defined(INCLUDED_ALPHACPU_H)
 #define INCLUDED_ALPHACPU_H
 
+#include <atomic>
+
 #include "SystemComponent.h"
 #include "System.h"
 #include "cpu_defs.h"
@@ -483,8 +485,8 @@ private:
     u64   cc;             /**< IPR CC: Cycle counter [HRM p 5-3] */
     u64   instruction_count;  /**< Number of times doclock has been called */
     bool  cc_ena;         /**< IPR CC_CTL: Cycle counter enabled [HRM p 5-3] */
-    bool  check_int;          /**< True if an interrupt may be pending */
-    bool  check_timers;
+    std::atomic<bool> check_int;    /**< Interrupt maybe pending; raised cross-thread by irq_h() */
+    std::atomic<bool> check_timers; /**< Delayed-irq countdown pending; set cross-thread by irq_h() */
     bool  fpen;           /**< IPR PCTX: fpe (floating point enable) [HRM p 5-21..23] */
     int   cm;           /**< IPR IER_CM: cm (current mode) [HRM p 5-9..10] */
     int   asn;          /**< IPR PCTX: asn (address space number) [HRM p 5-21..22] */
@@ -521,7 +523,7 @@ private:
     int   sien;         /**< IPR IER_CM: sien (software interrupt enable) [HRM p 5-9..10] */
     int   asten;        /**< IPR IER_CM: asten (AST interrupt enable) [HRM p 5-9..10] */
     int   sir;          /**< IPR SIRR: sir (software interrupt request) [HRM p 5-10..11] */
-    int   eir;          /**< external interrupt request */
+    std::atomic<int> eir;  /**< external interrupt request; raised cross-thread by irq_h() */
     int   slr;          /**< serial line interrupt request */
     int   crr;          /**< corrected read error interrupt */
     int   pcr;          /**< perf counter interrupt */
