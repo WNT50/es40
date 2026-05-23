@@ -254,6 +254,37 @@ static inline void dram_write(char* dram_ptr, u64 phys, int dsize, u64 data)
   }
 }
 
+/* Atomic compare-and-swap on a DRAM location, for Alpha STx_C (HRM 4.2):
+ * succeeds iff memory still holds the value the matching LDx_L observed.
+ * LL/SC operands are ISA-aligned, so the target is aligned. Returns true if
+ * memory held `expected` (now swapped to `desired`). */
+#if defined(_MSC_VER)
+#include <intrin.h>
+static inline bool dram_cas32(char* p, u32 expected, u32 desired)
+{
+  return (u32)_InterlockedCompareExchange((volatile long*)p, (long)desired, (long)expected) == expected;
+}
+static inline bool dram_cas64(char* p, u64 expected, u64 desired)
+{
+  return (u64)_InterlockedCompareExchange64((volatile long long*)p, (long long)desired, (long long)expected) == expected;
+}
+#else
+static inline bool dram_cas32(char* p, u32 expected, u32 desired)
+{
+  return __atomic_compare_exchange_n((u32*)p, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+static inline bool dram_cas64(char* p, u64 expected, u64 desired)
+{
+  return __atomic_compare_exchange_n((u64*)p, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+}
+#endif
+static inline bool dram_cas(char* dram_ptr, u64 phys, u64 expected, u64 desired, int size)
+{
+  char* p = dram_ptr + phys;
+  return (size == 32) ? dram_cas32(p, (u32)expected, (u32)desired)
+                      : dram_cas64(p, expected, desired);
+}
+
 /* Unpacked floating point number */
 struct ufp
 {
@@ -609,7 +640,7 @@ inline u64 fsqrt64(u64 asig, s32 exp)
   pbc = false;                                          \
   DATA_PHYS(va, ACCESS_READ, (size/8)-1);               \
   LLR;                         \
-  cSystem->cpu_lock(state.iProcNum, phys_address);      \
+  cSystem->cpu_lock(state.iProcNum, phys_address, size);      \
   if (pbc) {                                            \
     dest = 0;                                           \
     for (int ii=0; ii<(size/8); ii++) {                 \
@@ -639,7 +670,7 @@ inline u64 fsqrt64(u64 asig, s32 exp)
   pbc = false;                                            \
   DATA_PHYS(va, ACCESS_READ, (size/8)-1);                 \
   LLR;                           \
-  cSystem->cpu_lock(state.iProcNum, phys_address);        \
+  cSystem->cpu_lock(state.iProcNum, phys_address, size);        \
   if (pbc) {                                              \
     u64 aa = 0;                                           \
     for (int ii=0; ii<(size/8); ii++) {                   \
@@ -660,7 +691,6 @@ inline u64 fsqrt64(u64 asig, s32 exp)
 #define WRITE_PHYS(data, size)                         \
   if (phys_address < dram_size)                        \
   {                                                     \
-    cSystem->cpu_break_locks(phys_address, this);       \
     dram_write(dram_ptr, phys_address, size, data);    \
   }                                                     \
   else                                                 \
@@ -677,7 +707,6 @@ inline u64 fsqrt64(u64 asig, s32 exp)
       DATA_PHYS(va+ii, ACCESS_WRITE, 0);                    \
       if (phys_address < dram_size)                         \
       {                                                     \
-        cSystem->cpu_break_locks(phys_address, this);       \
         dram_write(dram_ptr, phys_address, 8, aa);          \
       }                                                     \
       else                                                  \
@@ -687,7 +716,6 @@ inline u64 fsqrt64(u64 asig, s32 exp)
   } else {                                                  \
     if (phys_address < dram_size)                           \
     {                                                       \
-      cSystem->cpu_break_locks(phys_address, this);         \
       dram_write(dram_ptr, phys_address, size, src);        \
     }                                                       \
     else                                                    \
@@ -698,34 +726,21 @@ inline u64 fsqrt64(u64 asig, s32 exp)
   {                                                         \
     u64 _stc_va = (va);                                     \
     u64 _stc_data = (src);                                  \
+    u64 _stc_exp = 0;                                       \
     pbc = false;                                            \
     DATA_PHYS(_stc_va, ACCESS_WRITE, (size/8)-1);           \
-    if (cSystem->cpu_unlock(state.iProcNum, phys_address))  \
+    /* STx_C: atomic compare-and-swap; succeeds iff still locked for this     \
+       address and memory is unchanged since the LDx_L. */                    \
+    if (cSystem->cpu_take_lock(state.iProcNum, phys_address, &_stc_exp) && !pbc) \
     {                                                       \
       LWR;                                                  \
-      if (pbc) {                                            \
-        u64 aa = _stc_data;                                 \
-        for (int ii=0; ii<(size/8); ii++) {                 \
-          DATA_PHYS(_stc_va+ii, ACCESS_WRITE, 0);           \
-          if (phys_address < dram_size)                     \
-          {                                                 \
-            cSystem->cpu_break_locks(phys_address, this);   \
-            dram_write(dram_ptr, phys_address, 8, aa);      \
-          }                                                 \
-          else                                              \
-            cSystem->WriteMem(phys_address, 8, aa, this);   \
-          aa >>= 8;                                         \
-        }                                                   \
-      } else {                                              \
-        if (phys_address < dram_size)                       \
-        {                                                   \
-          cSystem->cpu_break_locks(phys_address, this);     \
-          dram_write(dram_ptr, phys_address, size, _stc_data); \
-        }                                                   \
-        else                                                \
-          cSystem->WriteMem(phys_address, size, _stc_data, this); \
+      if (phys_address < dram_size)                         \
+        dest = dram_cas(dram_ptr, phys_address, _stc_exp, _stc_data, size) ? 1 : 0; \
+      else                                                  \
+      {                                                     \
+        cSystem->WriteMem(phys_address, size, _stc_data, this); \
+        dest = 1;                                           \
       }                                                     \
-      dest = 1;                                             \
     }                                                       \
     else                                                    \
       dest = 0;                                             \
@@ -752,13 +767,13 @@ inline u64 fsqrt64(u64 asig, s32 exp)
 #if defined(IDB)
 #define WRITE_PHYS_NT(data, size)                                          \
   { u64 _pa = ALIGN_PHYS((size) / 8);                                     \
-    if (_pa < dram_size) { cSystem->cpu_break_locks(_pa, this); dram_write(dram_ptr, _pa, size, data); } \
+    if (_pa < dram_size) { dram_write(dram_ptr, _pa, size, data); } \
     else cSystem->WriteMem(_pa, size, data, this); }                       \
   LWR
 #else
 #define WRITE_PHYS_NT(data, size)                                          \
   { u64 _pa = ALIGN_PHYS((size) / 8);                                     \
-    if (_pa < dram_size) { cSystem->cpu_break_locks(_pa, this); dram_write(dram_ptr, _pa, size, data); } \
+    if (_pa < dram_size) { dram_write(dram_ptr, _pa, size, data); } \
     else cSystem->WriteMem(_pa, size, data, this); }
 #endif
 

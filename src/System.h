@@ -278,11 +278,9 @@ public:
   u64           get_c_dim(int ProcNum);
   void          set_c_dim(int ProcNum, u64 value);
 
-  void          cpu_lock(int cpuid, u64 address);
-  bool          cpu_unlock(int cpuid, u64 address, bool clear = true);
-  void          cpu_break_locks(u64 address, CSystemComponent* source, bool include_source = false);
-  void          cpu_break_lock(int cpuid, CSystemComponent* source);
-  void          cpu_clear_lock(int cpuid);
+  void          cpu_lock(int cpuid, u64 address, int size = 64); // LDx_L: record locked addr + value read there (size in bits)
+  bool          cpu_take_lock(int cpuid, u64 address, u64* expected); // STx_C: consume lock; true + *expected if still held & matching
+  void          cpu_clear_lock(int cpuid);                     // exception/interrupt: drop the lock
   void          RequestSystemReset();
   bool          IsSystemResetRequested() const;
   bool          ProcessPendingReset();   // Returns true if a reset was performed.
@@ -311,7 +309,7 @@ private:
   static std::vector<uint32_t> split_mb_into_dimms(uint32_t total_mb);
 
   int           iNumCPUs;
-  CFastMutex* cpu_lock_mutex;
+  u64           cpu_lock_value[4]; // per-CPU LDx_L value, for STx_C compare-and-swap (transient; not in saved state)
 
   // Serializes drir RMW + delivery in interrupt() across device threads. On
   // CSystem (not in saved 'state'), so SaveState is unaffected.
@@ -320,7 +318,7 @@ private:
   /// The state structure contains all elements that need to be saved to the statefile.
   struct SSys_state
   {
-    int cpu_lock_flags;
+    std::atomic<int> cpu_lock_flags;
     u64 cpu_lock_address[4];
 
     /**

@@ -393,7 +393,7 @@ CSystem::CSystem(CConfigurator* cfg)
 	else
 		CHECK_ALLOCATION(memory = calloc(1 << iNumMemoryBits, 1));
 
-	cpu_lock_mutex = new CFastMutex("cpu-locking-lock");
+	// (no LL/SC lock to init: per-CPU state + atomic compare-and-swap, see cpu_lock())
 
 	printf("%s(%s): $Id$\n",
 		cfg->get_myName(), cfg->get_myValue());
@@ -653,6 +653,7 @@ void CSystem::ResetChipsetState()
 	// Re-establish the same power-on defaults used in the constructor.
 	state.cpu_lock_flags = 0;
 	memset(state.cpu_lock_address, 0, sizeof(state.cpu_lock_address));
+	memset(cpu_lock_value, 0, sizeof(cpu_lock_value));
 
 	for (int i = 0; i < 4; i++)
 		state.cchip.dim[i] = 0;
@@ -742,70 +743,53 @@ static inline bool cpu_lock_matches(u64 locked_address, u64 address)
 	return !((locked_address ^ address) & CPU_LOCK_MATCH_MASK);
 }
 
-void CSystem::cpu_lock(int cpuid, u64 address)
-{
-	SCOPED_FM_LOCK(cpu_lock_mutex);
+// --- Load-locked / store-conditional (HRM 4.2) -----------------------------
+// Value-compare model: each CPU records the address and value it observed at
+// LDx_L; the matching STx_C is an atomic compare-and-swap on that location
+// (dram_cas), so the "unchanged since LDx_L?" test and the store are one step.
+//
+// cpu_lock_flags is a shared bitmask (one bit per CPU), hence atomic RMW;
+// cpu_lock_address[]/cpu_lock_value[] are touched only by their owning CPU.
 
-	//  printf("cpu%d: lock %" PRIx64 ".   \n",cpuid,address);
-	state.cpu_lock_flags |= (1 << cpuid);
+void CSystem::cpu_lock(int cpuid, u64 address, int size)
+{
 	state.cpu_lock_address[cpuid] = address;
-}
-
-bool CSystem::cpu_unlock(int cpuid, u64 address, bool clear)
-{
-	SCOPED_FM_LOCK(cpu_lock_mutex);
-
-	bool retval = (address & CPU_LOCK_IO_MASK) ||
-	              ((state.cpu_lock_flags & (1 << cpuid)) &&
-	               cpu_lock_matches(state.cpu_lock_address[cpuid], address));
-
-	//  printf("cpu%d: unlock (%s).   \n",cpuid,retval?"ok":"failed");
-	if (clear)
-		state.cpu_lock_flags &= ~(1 << cpuid);
-	return retval;
-}
-
-void CSystem::cpu_break_locks(u64 address, CSystemComponent* source, bool include_source)
-{
-	int i;
-
-	SCOPED_FM_LOCK(cpu_lock_mutex);
-
-	for (i = 0; i < iNumCPUs; i++)
+	// Snapshot the value for the matching STx_C's compare-and-swap. A write in
+	// the gap before the actual load just yields a (legal) spurious STx_C fail.
+	u64 dram_sz = (U64(1) << iNumMemoryBits);
+	if (address + 8 <= dram_sz)        // common case: a full quadword is in range
 	{
-		if ((state.cpu_lock_flags & (1 << i)) &&
-		    cpu_lock_matches(state.cpu_lock_address[i], address) &&
-		    (include_source || (source != acCPUs[i])))
-		{
-			if (source != acCPUs[i])
-				printf("cpu%d: lock broken by %s.   \n", i, source ? source->devid_string : "external write");
-			state.cpu_lock_flags &= ~(1 << i);
-		}
+		char* p = (char*)memory + address;
+		cpu_lock_value[cpuid] = (size == 32) ? (u64)(*(u32*)p) : *(u64*)p;
 	}
+	else if (address + 4 <= dram_sz)   // in memory but no room for 8 bytes (edge)
+		cpu_lock_value[cpuid] = (u64)(*(u32*)((char*)memory + address));
+	else
+		cpu_lock_value[cpuid] = 0;     // I/O space (or memory edge): value unused, STx_C treated as held
+	state.cpu_lock_flags |= (1 << cpuid);   // atomic fetch_or
 }
 
-void CSystem::cpu_break_lock(int cpuid, CSystemComponent* source)
+bool CSystem::cpu_take_lock(int cpuid, u64 address, u64* expected)
 {
-	SCOPED_FM_LOCK(cpu_lock_mutex);
-	printf("cpu%d: lock broken by %s.   \n", cpuid, source ? source->devid_string : "external write");
-	state.cpu_lock_flags &= ~(1 << cpuid);
+	// I/O-space conditional stores have no cache line to watch; treat as held.
+	bool held = (address & CPU_LOCK_IO_MASK) ||
+	            ((state.cpu_lock_flags.load() & (1 << cpuid)) &&
+	             cpu_lock_matches(state.cpu_lock_address[cpuid], address));
+
+	// STx_C always consumes the lock, success or fail (HRM 4.2.4).
+	state.cpu_lock_flags &= ~(1 << cpuid);  // atomic fetch_and
+	if (held)
+		*expected = cpu_lock_value[cpuid];
+	return held;
 }
 
 /**
- * Quietly clear one CPU's load-locked flag.
- *
- * Called when that CPU takes an exception or interrupt (or any other event
- * that disturbs an in-progress LDx_L/STx_C sequence). Per HRM 4.2.4 / the
- * Alpha AHB, a STx_C must fail if an exception/interrupt occurred since the
- * matching LDx_L; clearing lock_flag here makes the subsequent STx_C fail as
- * required. f nothing is locked on this CPU, skip the mutex.
+ * Drop one CPU's load lock. Called when that CPU takes an exception or interrupt
+ * (HRM 4.2.4: a pending STx_C must fail if an exception/interrupt intervened).
  **/
 void CSystem::cpu_clear_lock(int cpuid)
 {
-	if (!(state.cpu_lock_flags & (1 << cpuid)))
-		return;
-	SCOPED_FM_LOCK(cpu_lock_mutex);
-	state.cpu_lock_flags &= ~(1 << cpuid);
+	state.cpu_lock_flags &= ~(1 << cpuid);  // atomic fetch_and
 }
 
 /**
@@ -900,9 +884,6 @@ void CSystem::WriteMem(u64 address, int dsize, u64 data, CSystemComponent* sourc
 	u32   t32;
 	u16   t16;
 #endif //defined(ALIGN_MEM_ACCESS)
-	if (state.cpu_lock_flags)
-		cpu_break_locks(address, source);
-
 	a = address & U64(0x00000807ffffffff);
 
 	if (a >> iNumMemoryBits) // non-memory

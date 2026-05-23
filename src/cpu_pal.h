@@ -500,13 +500,18 @@
                                                                            \
   case 2:       /* longword physical conditional */                           \
     phys_address = state.r[REG_2] + DISP_12;                                  \
-    if(cSystem->cpu_unlock(state.iProcNum, phys_address, false))              \
     {                                                                         \
-      WRITE_PHYS_NT(state.r[REG_1], 32);                                      \
-      state.r[REG_1] = 1;                                                     \
+      u64 _stc_exp = 0;                                                       \
+      if (cSystem->cpu_take_lock(state.iProcNum, phys_address, &_stc_exp))    \
+      {                                                                       \
+        if (phys_address < dram_size)                                        \
+          state.r[REG_1] = dram_cas(dram_ptr, phys_address, _stc_exp, state.r[REG_1], 32) ? 1 : 0; \
+        else                                                                  \
+        { cSystem->WriteMem(phys_address, 32, state.r[REG_1], this); state.r[REG_1] = 1; } \
+      }                                                                       \
+      else                                                                    \
+        state.r[REG_1] = 0;                                                   \
     }                                                                         \
-    else                                                                      \
-      state.r[REG_1] = 0;                                                     \
     break;                                                                    \
                                                                            \
   case 4:       /* longword virtual (HRM 6.4.1 Table 6-4 TYPE 0102) -- write \
@@ -535,13 +540,18 @@
                                                                             \
   case 3:       /* quadword physical conditional */                            \
     phys_address = state.r[REG_2] + DISP_12;                                   \
-    if(cSystem->cpu_unlock(state.iProcNum, phys_address, false))               \
     {                                                                          \
-      WRITE_PHYS_NT(state.r[REG_1], 64);                                       \
-      state.r[REG_1] = 1;                                                      \
+      u64 _stc_exp = 0;                                                        \
+      if (cSystem->cpu_take_lock(state.iProcNum, phys_address, &_stc_exp))     \
+      {                                                                        \
+        if (phys_address < dram_size)                                         \
+          state.r[REG_1] = dram_cas(dram_ptr, phys_address, _stc_exp, state.r[REG_1], 64) ? 1 : 0; \
+        else                                                                   \
+        { cSystem->WriteMem(phys_address, 64, state.r[REG_1], this); state.r[REG_1] = 1; } \
+      }                                                                        \
+      else                                                                     \
+        state.r[REG_1] = 0;                                                    \
     }                                                                          \
-    else                                                                       \
-      state.r[REG_1] = 0;                                                      \
     break;                                                                     \
                                                                             \
   case 5:       /* quadword virtual (HRM 6.4.1 Table 6-4 TYPE 0102) --       \
