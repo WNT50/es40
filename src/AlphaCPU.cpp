@@ -374,6 +374,19 @@ void CAlphaCPU::run()
 			CThread::sleep(1);
 		}
 		printf("*** CPU%d *** STARTING ***\n", get_cpuid());
+
+		// Re-base the timing-calibration epoch to when execution actually begins:
+		// a secondary parks (wait_for_start) before the primary releases it, so
+		// leaving start_time at init time makes check_state() derive a wildly
+		// wrong cc_per_instruction (huge elapsed wall-time vs ~0 instructions).
+		start_time = std::chrono::steady_clock::now();
+		next_timer_fire = start_time;
+		cc_large = 0;
+		state.instruction_count = 0;
+		prev_icount = 0;
+		prev_cc = 0;
+		prev_time = 0;
+
 		for (;;)
 		{
 			if (StopThread)
