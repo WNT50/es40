@@ -346,6 +346,19 @@ typedef struct ufp  UFP;
 /* 64b * 64b unsigned multiply */
 inline u64 uemul64(u64 a, u64 b, u64* hi)
 {
+#if defined(_MSC_VER) && defined(_M_X64)
+  /* Full 128b product in one MULX; bit-identical to the portable path below. */
+  u64 h;
+  const u64 lo = _umul128(a, b, &h);
+  if (hi)
+    *hi = h;
+  return lo;
+#elif defined(__SIZEOF_INT128__)
+  const unsigned __int128 p = (unsigned __int128)a * (unsigned __int128)b;
+  if (hi)
+    *hi = (u64)(p >> 64);
+  return (u64)p;
+#else
   u64 ahi;
 
   u64 alo;
@@ -382,6 +395,7 @@ inline u64 uemul64(u64 a, u64 b, u64* hi)
   if (hi)
     *hi = rhi & X64_QUAD;
   return rlo;
+#endif
 }
 
 /* 64b / 64b unsigned fraction divide */
