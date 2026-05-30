@@ -16,8 +16,12 @@ enum SafeOp {
   OP_AND, OP_BIS, OP_XOR, OP_BIC, OP_ORNOT, OP_EQV,
   OP_CMPEQ, OP_CMPLT, OP_CMPLE, OP_CMPULT, OP_CMPULE,
   OP_SLL, OP_SRL, OP_SRA, OP_MULQ,
-  OP_LDQ, OP_LDL                 // memory-format loads: Ra = MEM[Rb + disp16]
+  OP_LDQ, OP_LDL,                // memory-format loads: Ra = MEM[Rb + disp16]
+  // Branch-format terminators (contiguous; see is_branch). Conditional on Ra, plus BR/BSR.
+  OP_BEQ, OP_BNE, OP_BLT, OP_BLE, OP_BGT, OP_BGE, OP_BLBC, OP_BLBS, OP_BR, OP_BSR
 };
+
+static inline bool is_branch(SafeOp op) { return op >= OP_BEQ && op <= OP_BSR; }
 
 // Safe = goto-free, register-only operate-format ops (no trap, memory, or branch).
 SafeOp classify(uint32_t ins)
@@ -53,6 +57,12 @@ SafeOp classify(uint32_t ins)
       break;
     case 0x28: return OP_LDL;   // memory-format loads (Ra = MEM[Rb+disp16])
     case 0x29: return OP_LDQ;
+    // Branch format: opcode | Ra | disp21. Conditional on Ra, plus BR/BSR.
+    case 0x30: return OP_BR;    case 0x34: return OP_BSR;
+    case 0x38: return OP_BLBC;  case 0x39: return OP_BEQ;
+    case 0x3a: return OP_BLT;   case 0x3b: return OP_BLE;
+    case 0x3c: return OP_BLBS;  case 0x3d: return OP_BNE;
+    case 0x3e: return OP_BGE;   case 0x3f: return OP_BGT;
   }
   return OP_NONE;
 }
@@ -79,7 +89,10 @@ CJitEngine::~CJitEngine()
 CJitEngine::JitBlock* CJitEngine::record(uint64_t virt_pc, uint64_t phys_pc, uint32_t asn, bool asm_global, uint32_t n_instr)
 {
   JitBlock& b = m_blocks[index_of(virt_pc)];
-  if (b.valid && b.tag == virt_pc && (b.asm_global || b.asn == asn)) {  // re-seen; keep compiled state
+  // Re-seen only if the live physical still matches: virtual+ASN keying can't see a
+  // page remap, so a changed phys means the recorded bytes are stale -- fall through
+  // and re-record (clears code/compiled below, forcing a recompile from the new phys).
+  if (b.valid && b.tag == virt_pc && (b.asm_global || b.asn == asn) && b.phys == phys_pc) {
     b.n_instr = n_instr;
     return &b;
   }
@@ -130,10 +143,15 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
   // there would be the wrong instructions. (The page-crossing case verify caught.)
   const uint64_t page_end = (phys & ~(uint64_t) 0x1FFF) + 0x2000;
   uint32_t plen = 0;
+  bool terminator_branch = false;       // last instruction is a compiled branch (sets its own PC)
   while (plen < b->n_instr && plen < 64
-         && (phys + (uint64_t) plen * 4) < page_end
-         && classify(words[plen]) != OP_NONE)
+         && (phys + (uint64_t) plen * 4) < page_end)
+  {
+    SafeOp sop = classify(words[plen]);
+    if (sop == OP_NONE) break;          // uncompilable op ends the straight-line prefix
     plen++;
+    if (is_branch(sop)) { terminator_branch = true; break; }   // a branch terminates the block
+  }
   if (plen == 0) return;
 
   // Emit  uint32_t fn(CAlphaCPU* cpu, uint64_t* regs)  (Win64: cpu=RCX, regs=RDX).
@@ -242,6 +260,38 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
       continue;
     }
 
+    // Branch terminators: compute the target into state.pc, then end the block. The
+    // branch is at index i, so the PC of the next instruction is b->tag + 4*(i+1).
+    if (is_branch(op)) {
+      const int64_t  bdisp = (int64_t) ((uint64_t) (ins & 0x1FFFFF) << 43) >> 43;  // sext disp21
+      const uint64_t fall  = b->tag + 4 * (uint64_t) (i + 1);
+      const uint64_t tgt   = fall + (uint64_t) (bdisp * 4);
+      if (op == OP_BR || op == OP_BSR) {                 // Ra = return address; PC = target
+        if (ra != 31) { a.mov(x86::r10, imm(fall)); a.mov(reg(ra), x86::r10); }
+        a.mov(x86::r10, imm(tgt));
+      } else {                                           // conditional: PC = cond ? target : fall
+        if (ra == 31) a.xor_(x86::eax, x86::eax);
+        else          a.mov(x86::rax, reg(ra));
+        a.mov(x86::r10, imm(fall));
+        a.mov(x86::r11, imm(tgt));
+        if (op == OP_BLBC || op == OP_BLBS) a.test(x86::rax, imm(1));
+        else                                a.test(x86::rax, x86::rax);
+        switch (op) {
+          case OP_BEQ:  a.cmovz(x86::r10, x86::r11);  break;
+          case OP_BNE:  a.cmovnz(x86::r10, x86::r11); break;
+          case OP_BLT:  a.cmovs(x86::r10, x86::r11);  break;
+          case OP_BGE:  a.cmovns(x86::r10, x86::r11); break;
+          case OP_BLE:  a.cmovle(x86::r10, x86::r11); break;
+          case OP_BGT:  a.cmovg(x86::r10, x86::r11);  break;
+          case OP_BLBC: a.cmovz(x86::r10, x86::r11);  break;
+          case OP_BLBS: a.cmovnz(x86::r10, x86::r11); break;
+          default: break;
+        }
+      }
+      a.mov(x86::qword_ptr(x86::rsi, m_off.state_pc), x86::r10);
+      continue;
+    }
+
     switch (op) {
       case OP_ADDQ:  op1_rax(); op2_rcx(); a.add(x86::rax, x86::rcx); break;
       case OP_SUBQ:  op1_rax(); op2_rcx(); a.sub(x86::rax, x86::rcx); break;
@@ -285,7 +335,8 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
 
     if (rc != 31) a.mov(reg(rc), x86::rax);
   }
-  set_pc(b->tag + 4 * (uint64_t) plen);   // straight-line fall-through: next PC
+  // Next PC: a branch terminator already wrote it; otherwise it's the fall-through.
+  if (!terminator_branch) set_pc(b->tag + 4 * (uint64_t) plen);
   a.mov(x86::eax, imm(plen));   // no fault: all instructions completed
   a.bind(done);
   a.add(x86::rsp, imm(40));

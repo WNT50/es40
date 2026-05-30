@@ -731,13 +731,29 @@ void CAlphaCPU::jit_run(int budget)
 		const u64 start_virt = state.pc;
 		const u32 start_asn  = (u32) state.asn;
 
-		// Hot path: virtual+ASN lookup, no address translation.
+		// Peek the I-stream up front: gives the physical address (for staleness
+		// validation and recording), the ASM bit, and the I-fetch fault check.
+		// Virtual+ASN keying can't see a page remap, so a block's recorded physical
+		// must still match the live translation before we trust its compiled code --
+		// otherwise we'd run stale bytes. (The interpreter self-heals via icache
+		// refill; the JIT has no such recheck.) A changed phys re-records/recompiles.
+		u32 _ins;
+		state.current_pc = state.pc;   // get_icache TB-miss handler reads current_pc
+		if (get_icache(state.pc, &_ins))
+		{
+			--budget;
+			continue;
+		}
+		const u64  start_phys = state.pc_phys;
+		const bool start_asm  = state.icache[state.last_found_icache].asm_bit;
+
+		// Hot path: virtual+ASN lookup, validated against the live physical.
 		CJitEngine::JitBlock* b = m_jit->lookup(start_virt, start_asn);
 
 		// Run the compiled safe prefix natively when available -- but not while an
 		// interrupt or delayed timer is pending. Compiled blocks don't run the
 		// per-instruction polls, so run the interpreter.
-		if (b && b->code && (int) b->prefix_len <= budget
+		if (b && b->code && b->phys == start_phys && (int) b->prefix_len <= budget
 			&& !state.check_int && !state.check_timers)
 		{
 #ifdef JIT_VERIFY
@@ -768,7 +784,27 @@ void CAlphaCPU::jit_run(int budget)
 				execute();
 				--budget;
 				vpc += 4;
-				if (state.pc != vpc) { clean = false; break; }
+				if (state.pc != vpc) {
+					// The terminator (a compiled branch at the last index) diverges to its
+					// target -- expected. But execute() services an async interrupt/trap at the
+					// TOP, before the instruction runs, so the interpreter can divert to a PAL
+					// handler at the terminator WITHOUT executing the branch. Accept the
+					// divergence only when state.pc is the branch's actual target; otherwise it's
+					// an interrupt/trap and the compiled block (which doesn't model interrupts --
+					// the dispatcher's !check_int guard handles that) legitimately differs, so
+					// skip the compare instead of flagging a false mismatch.
+					bool ok_branch = false;
+					if (k == b->prefix_len - 1 &&
+					    (opc == 0x30 || opc == 0x34 || (opc >= 0x38 && opc <= 0x3f)))
+					{
+						const int64_t bdisp = (int64_t) ((uint64_t) (ins & 0x1FFFFF) << 43) >> 43;
+						const u64 tgt = vpc + (u64) (bdisp * 4);   // vpc == branch_pc + 4 (fall-through)
+						ok_branch = (state.pc == tgt);
+					}
+					if (!ok_branch)
+						clean = false;
+					break;
+				}
 				if (isld && vn < 64)
 				{
 					m_jit_vaddr[vn] = eva;
@@ -787,10 +823,25 @@ void CAlphaCPU::jit_run(int budget)
 				m_jit_vreplay = false;
 				if (done == b->prefix_len)
 				{
-					if (state.pc != interp_pc)
-						printf("[JIT][VERIFY] PC MISMATCH at %016llx: interp=%016llx jit=%016llx\n",
+					if (state.pc != interp_pc) {
+						// Dump the JIT's source (DRAM at b->phys, vw[]) vs the icache (what the
+						// interpreter actually fetches), word by word. If the middle words differ
+						// the icache holds a stale/different version the JIT never compiled.
+						const int icl = (int) ((start_virt >> 11) & (ICACHE_ENTRIES - 1));
+						const u32 wb  = (u32) ((start_virt >> 2) & ICACHE_INDEX_MASK);
+						printf("[JIT][VERIFY] PC MISMATCH at %016llx: interp=%016llx jit=%016llx plen=%u\n",
 						       (unsigned long long) start_virt, (unsigned long long) interp_pc,
-						       (unsigned long long) state.pc);
+						       (unsigned long long) state.pc, b->prefix_len);
+						printf("   dram:");
+						for (u32 w = 0; w < b->prefix_len && w < 16; ++w) printf(" %08x", vw[w]);
+						printf("\n   icch:");
+						for (u32 w = 0; w < b->prefix_len && w < 16; ++w)
+							printf(" %08x", endian_32(state.icache[icl].data[(wb + w) & ICACHE_INDEX_MASK]));
+						printf("\n   r1 i=%016llx j=%016llx  r2 i=%016llx j=%016llx  r5 snap=%016llx\n",
+						       (unsigned long long) state.r[1], (unsigned long long) jr[1],
+						       (unsigned long long) state.r[2], (unsigned long long) jr[2],
+						       (unsigned long long) snap[5]);
+					}
 					m_jit->verify_compare(start_virt, state.r, jr);
 				}
 				state.pc = interp_pc;   // restore; the block's PC write was only for the check
@@ -815,18 +866,8 @@ void CAlphaCPU::jit_run(int budget)
 #endif
 		}
 
-		// Miss path (cold): peek the I-stream for the physical address, ASM bit, and
-		// fault check, then interpret the block, record it, and compile its prefix.
-		u32 _ins;
-		state.current_pc = state.pc;   // get_icache TB-miss handler reads current_pc
-		if (get_icache(state.pc, &_ins))
-		{
-			--budget;
-			continue;
-		}
-		const u64  start_phys = state.pc_phys;
-		const bool start_asm  = state.icache[state.last_found_icache].asm_bit;
-
+		// Miss path (cold): the up-front I-stream peek already gave start_phys/start_asm.
+		// Interpret the block, record it, and compile its prefix.
 		u32 n = 0;
 		u64 expected = start_virt;
 		while (budget > 0)
