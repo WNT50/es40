@@ -150,6 +150,14 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
   a.mov(x86::rbx, x86::rdx);   // regs base
 
   Label done = a.new_label();  // shared bail/return target
+
+  // The compiled block computes its own next PC into state.pc at every exit (the
+  // foundation for branch compilation and block linking). R10 is scratch here.
+  auto set_pc = [&](uint64_t pc_val) {
+    a.mov(x86::r10, imm(pc_val));
+    a.mov(x86::qword_ptr(x86::rsi, m_off.state_pc), x86::r10);
+  };
+
   for (uint32_t i = 0; i < plen; ++i) {
     uint32_t ins = words[i];
     SafeOp op = classify(ins);
@@ -191,6 +199,7 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
         Label ok = a.new_label();
         a.test(x86::eax, x86::eax);
         a.jz(ok);
+        set_pc(b->tag + 4 * (uint64_t) i);               // resume at the faulting load
         a.mov(x86::eax, imm(i));                          // fault: bail, i instrs done
         a.jmp(done);
         a.bind(ok);
@@ -276,6 +285,7 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
 
     if (rc != 31) a.mov(reg(rc), x86::rax);
   }
+  set_pc(b->tag + 4 * (uint64_t) plen);   // straight-line fall-through: next PC
   a.mov(x86::eax, imm(plen));   // no fault: all instructions completed
   a.bind(done);
   a.add(x86::rsp, imm(40));

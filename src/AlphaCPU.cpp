@@ -447,6 +447,7 @@ void CAlphaCPU::init()
 		o.state_asn0    = (uint32_t) ((char*) &state.asn0 - (char*) this);
 		o.dram_ptr      = (uint32_t) ((char*) &dram_ptr   - (char*) this);
 		o.dram_size     = (uint32_t) ((char*) &dram_size  - (char*) this);
+		o.state_pc      = (uint32_t) ((char*) &state.pc   - (char*) this);
 		m_jit->set_offsets(o);
 	}
 #endif
@@ -779,18 +780,26 @@ void CAlphaCPU::jit_run(int budget)
 			{
 				u64 jr[32];
 				memcpy(jr, snap, sizeof(jr));
+				const u64 interp_pc = state.pc;   // interpreter is authoritative for the PC
 				m_jit_vreplay = true;
 				m_jit_vlog_i = 0;
-				const u32 done = b->code(this, jr);
+				const u32 done = b->code(this, jr);   // also writes state.pc (the JIT's next PC)
 				m_jit_vreplay = false;
 				if (done == b->prefix_len)
+				{
+					if (state.pc != interp_pc)
+						printf("[JIT][VERIFY] PC MISMATCH at %016llx: interp=%016llx jit=%016llx\n",
+						       (unsigned long long) start_virt, (unsigned long long) interp_pc,
+						       (unsigned long long) state.pc);
 					m_jit->verify_compare(start_virt, state.r, jr);
+				}
+				state.pc = interp_pc;   // restore; the block's PC write was only for the check
 			}
 			continue;
 #else
 			const u32 done = b->code(this, &state.r[0]);
 			state.r[31] = 0;
-			state.pc = start_virt + 4 * (u64) done;
+			// state.pc is written by the compiled block itself (next PC, or the bail PC).
 			// Match the interpreter's per-instruction accounting for the compiled ops:
 			// cycle counter (RPCC) and instruction count. Skipping it stalls state.cc and
 			// breaks guest timing -- and the verify can't catch it (these are IPRs, not GPRs).
