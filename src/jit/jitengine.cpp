@@ -517,6 +517,13 @@ void CJitEngine::compile_block(JitBlock* b, const uint8_t* dram, uint64_t dram_s
     a.test(x86::rcx, x86::rcx);                            a.jz(miss);
     a.mov(x86::rdx, x86::qword_ptr(x86::rax, off_tag));        // succ->tag
     a.cmp(x86::rdx, x86::r10);                             a.jne(miss);   // not this exit's target
+    // The dispatcher runs a compiled PALmode block only when SDE is set (its shadow remap
+    // assumes it); the cached link must honor the same guard. Don't tail into a PALmode
+    // successor (tag bit 0) with SDE clear , bail to the interpreter
+    Label chain_ok = a.new_label();
+    a.test(x86::r10, imm(1));                             a.jz(chain_ok);   // non-PAL target: chain
+    a.cmp(x86::byte_ptr(x86::rsi, m_off.sde), imm(0));    a.je(miss);       // PALmode + !SDE: don't
+    a.bind(chain_ok);
     a.jmp(x86::rcx);                                           // HIT: tail in (shared frame)
     a.bind(miss);
     a.mov(x86::rax, imm((uint64_t) b));
